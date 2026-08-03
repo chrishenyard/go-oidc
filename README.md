@@ -26,12 +26,14 @@ The example is configured to use Keycloak, but the package can work with other s
 ## Project Structure
 
 ```text
-go-web-api/
+go-oidc/
 │── errors.go
 │── memory_store.go
 │── middleware.go
 │── oidc.go
 ├── go.mod
+├── go.sum
+
 ```
 
 ## Authentication Flow
