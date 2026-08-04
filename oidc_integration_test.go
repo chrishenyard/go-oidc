@@ -20,12 +20,12 @@ import (
 
 const testTransactionCookieName = "test_oidc_transaction"
 
-func TestNew_WithValidKeycloakConfiguration(t *testing.T) {
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		15*time.Second,
-	)
-	defer cancel()
+func newIntegrationAuthClient(
+	t *testing.T,
+	ctx context.Context,
+	store auth.Store,
+) *auth.Client {
+	t.Helper()
 
 	client, err := auth.New(
 		ctx,
@@ -43,23 +43,298 @@ func TestNew_WithValidKeycloakConfiguration(t *testing.T) {
 				"roles",
 			},
 
-			Store: auth.NewMemoryStore(),
+			Store: store,
 
-			CookieSecure: false,
+			TransactionCookieName: testTransactionCookieName,
+			SessionCookieName:     testSessionCookieName,
 
 			TransactionLifetime: 5 * time.Minute,
 			SessionLifetime:     8 * time.Hour,
+
+			CookieSecure:   false,
+			CookieSameSite: http.SameSiteLaxMode,
 
 			LoginSuccessURL: "/dashboard",
 		},
 	)
 	if err != nil {
 		t.Fatalf(
-			"create authentication client using issuer %q: %v",
-			integrationEnvironment.IssuerURL,
+			"create integration auth client: %v",
 			err,
 		)
 	}
+
+	return client
+}
+
+type authenticatedTestSession struct {
+	Cookie  *http.Cookie
+	Session auth.Session
+}
+
+func authenticateTestUser(
+	t *testing.T,
+	ctx context.Context,
+	client *auth.Client,
+	store *auth.MemoryStore,
+	username string,
+	password string,
+) authenticatedTestSession {
+	t.Helper()
+
+	/*
+		Start the application login flow.
+	*/
+	loginRequest := httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1:8081/login",
+		nil,
+	)
+
+	loginResponse := httptest.NewRecorder()
+
+	client.LoginHandler().ServeHTTP(
+		loginResponse,
+		loginRequest,
+	)
+
+	loginResult := loginResponse.Result()
+	defer loginResult.Body.Close()
+
+	if loginResult.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(loginResult.Body)
+
+		t.Fatalf(
+			"expected login status %d, got %d: %s",
+			http.StatusFound,
+			loginResult.StatusCode,
+			string(body),
+		)
+	}
+
+	authorizationURL := loginResult.Header.Get("Location")
+	if authorizationURL == "" {
+		t.Fatal("expected authorization redirect URL")
+	}
+
+	transactionCookie := findCookie(
+		loginResult.Cookies(),
+		testTransactionCookieName,
+	)
+	if transactionCookie == nil {
+		t.Fatalf(
+			"expected transaction cookie %q",
+			testTransactionCookieName,
+		)
+	}
+
+	/*
+		Create a browser-like client that preserves Keycloak cookies.
+	*/
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("create cookie jar: %v", err)
+	}
+
+	browser := &http.Client{
+		Jar: jar,
+
+		CheckRedirect: func(
+			request *http.Request,
+			via []*http.Request,
+		) error {
+			if request.URL.Host == "127.0.0.1:8081" {
+				return http.ErrUseLastResponse
+			}
+
+			if len(via) >= 10 {
+				return errors.New("too many redirects")
+			}
+
+			return nil
+		},
+
+		Timeout: 15 * time.Second,
+	}
+
+	/*
+		Load Keycloak's login page.
+	*/
+	keycloakLoginResponse, err := browser.Get(authorizationURL)
+	if err != nil {
+		t.Fatalf(
+			"request Keycloak login page: %v",
+			err,
+		)
+	}
+	defer keycloakLoginResponse.Body.Close()
+
+	if keycloakLoginResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(
+			io.LimitReader(
+				keycloakLoginResponse.Body,
+				4096,
+			),
+		)
+
+		t.Fatalf(
+			"expected Keycloak login status %d, got %d: %s",
+			http.StatusOK,
+			keycloakLoginResponse.StatusCode,
+			string(body),
+		)
+	}
+
+	loginFormAction, err := findLoginFormAction(
+		keycloakLoginResponse.Body,
+	)
+	if err != nil {
+		t.Fatalf(
+			"find Keycloak login form: %v",
+			err,
+		)
+	}
+
+	actionURL, err := keycloakLoginResponse.Request.URL.Parse(
+		loginFormAction,
+	)
+	if err != nil {
+		t.Fatalf(
+			"resolve Keycloak login form action: %v",
+			err,
+		)
+	}
+
+	/*
+		Submit the test user's credentials.
+	*/
+	form := url.Values{
+		"username": {username},
+		"password": {password},
+	}
+
+	formRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		actionURL.String(),
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		t.Fatalf(
+			"create Keycloak login request: %v",
+			err,
+		)
+	}
+
+	formRequest.Header.Set(
+		"Content-Type",
+		"application/x-www-form-urlencoded",
+	)
+
+	keycloakCallbackResponse, err := browser.Do(formRequest)
+	if err != nil {
+		t.Fatalf(
+			"submit Keycloak login form: %v",
+			err,
+		)
+	}
+	defer keycloakCallbackResponse.Body.Close()
+
+	if keycloakCallbackResponse.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(
+			io.LimitReader(
+				keycloakCallbackResponse.Body,
+				4096,
+			),
+		)
+
+		t.Fatalf(
+			"expected Keycloak callback redirect %d, got %d: %s",
+			http.StatusFound,
+			keycloakCallbackResponse.StatusCode,
+			string(body),
+		)
+	}
+
+	callbackURL := keycloakCallbackResponse.Header.Get("Location")
+	if callbackURL == "" {
+		t.Fatal("expected callback Location header")
+	}
+
+	/*
+		Pass Keycloak's callback to the application callback handler.
+	*/
+	callbackRequest := httptest.NewRequest(
+		http.MethodGet,
+		callbackURL,
+		nil,
+	)
+
+	callbackRequest.AddCookie(transactionCookie)
+
+	callbackResponse := httptest.NewRecorder()
+
+	client.CallbackHandler().ServeHTTP(
+		callbackResponse,
+		callbackRequest,
+	)
+
+	callbackResult := callbackResponse.Result()
+	defer callbackResult.Body.Close()
+
+	if callbackResult.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(callbackResult.Body)
+
+		t.Fatalf(
+			"expected callback status %d, got %d: %s",
+			http.StatusFound,
+			callbackResult.StatusCode,
+			string(body),
+		)
+	}
+
+	sessionCookie := findCookie(
+		callbackResult.Cookies(),
+		testSessionCookieName,
+	)
+	if sessionCookie == nil {
+		t.Fatalf(
+			"expected session cookie %q",
+			testSessionCookieName,
+		)
+	}
+
+	session, err := store.GetSession(
+		ctx,
+		sessionCookie.Value,
+	)
+	if err != nil {
+		t.Fatalf(
+			"retrieve authenticated session: %v",
+			err,
+		)
+	}
+
+	return authenticatedTestSession{
+		Cookie:  sessionCookie,
+		Session: session,
+	}
+}
+
+func TestNew_WithValidKeycloakConfiguration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
+	defer cancel()
+
+	store := auth.NewMemoryStore()
+
+	client := newIntegrationAuthClient(
+		t,
+		ctx,
+		store,
+	)
 
 	if client == nil {
 		t.Fatal("expected auth.New to return a non-nil client")
@@ -851,6 +1126,166 @@ func TestCallback_CreatesAuthenticatedSession(t *testing.T) {
 		t.Errorf(
 			"expected cleared transaction cookie MaxAge below zero, got %d",
 			clearedTransactionCookie.MaxAge,
+		)
+	}
+}
+
+func TestRequireAuthentication_WithValidSession_AllowsRequest(
+	t *testing.T,
+) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	store := auth.NewMemoryStore()
+
+	client := newIntegrationAuthClient(
+		t,
+		ctx,
+		store,
+	)
+
+	authenticatedSession := authenticateTestUser(
+		t,
+		ctx,
+		client,
+		store,
+		testUsername,
+		testPassword,
+	)
+
+	var handlerCalled bool
+
+	protectedHandler := http.HandlerFunc(
+		func(
+			w http.ResponseWriter,
+			r *http.Request,
+		) {
+			handlerCalled = true
+
+			claims, ok := auth.ClaimsFromContext(
+				r.Context(),
+			)
+			if !ok {
+				t.Error(
+					"expected authenticated claims in request context",
+				)
+
+				http.Error(
+					w,
+					"claims unavailable",
+					http.StatusInternalServerError,
+				)
+				return
+			}
+
+			if claims.Subject == "" {
+				t.Error("expected nonempty subject claim")
+			}
+
+			if claims.Email != "alice@example.com" {
+				t.Errorf(
+					"expected email %q, got %q",
+					"alice@example.com",
+					claims.Email,
+				)
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+			_, _ = w.Write(
+				[]byte("authenticated"),
+			)
+		},
+	)
+
+	handler := client.RequireAuthentication(
+		protectedHandler,
+	)
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1:8081/dashboard",
+		nil,
+	)
+
+	request.AddCookie(
+		authenticatedSession.Cookie,
+	)
+
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(
+		response,
+		request,
+	)
+
+	result := response.Result()
+	defer result.Body.Close()
+
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatalf(
+			"read protected response body: %v",
+			err,
+		)
+	}
+
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d: %s",
+			http.StatusOK,
+			result.StatusCode,
+			string(body),
+		)
+	}
+
+	if !handlerCalled {
+		t.Fatal(
+			"expected protected handler to be called",
+		)
+	}
+
+	if string(body) != "authenticated" {
+		t.Errorf(
+			"expected response body %q, got %q",
+			"authenticated",
+			string(body),
+		)
+	}
+
+	/*
+		The request used an unexpired access token, so the stored
+		session should still exist after authentication.
+	*/
+	storedSession, err := store.GetSession(
+		ctx,
+		authenticatedSession.Cookie.Value,
+	)
+	if err != nil {
+		t.Fatalf(
+			"retrieve session after protected request: %v",
+			err,
+		)
+	}
+
+	if storedSession.Token == nil {
+		t.Fatal(
+			"expected stored OAuth token after protected request",
+		)
+	}
+
+	if storedSession.Token.AccessToken == "" {
+		t.Error(
+			"expected stored access token after protected request",
+		)
+	}
+
+	if storedSession.RawIDToken == "" {
+		t.Error(
+			"expected stored ID token after protected request",
 		)
 	}
 }
