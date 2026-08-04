@@ -624,7 +624,7 @@
     "enabled" : true,
     "alwaysDisplayInConsole" : false,
     "clientAuthenticatorType" : "client-secret",
-    "secret" : "test-only-secret",
+    "secret" : "test-client-secret",
     "redirectUris" : [ "http://127.0.0.1/*" ],
     "webOrigins" : [ "http://127.0.0.1/" ],
     "notBefore" : 0,
@@ -2122,7 +2122,7 @@
     "alias" : "UPDATE_PROFILE",
     "name" : "Update Profile",
     "providerId" : "UPDATE_PROFILE",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 40,
     "config" : { }
@@ -2130,7 +2130,7 @@
     "alias" : "VERIFY_EMAIL",
     "name" : "Verify Email",
     "providerId" : "VERIFY_EMAIL",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 50,
     "config" : { }
@@ -2138,7 +2138,7 @@
     "alias" : "CONFIGURE_TOTP",
     "name" : "Configure OTP",
     "providerId" : "CONFIGURE_TOTP",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 54,
     "config" : { }
@@ -2146,7 +2146,7 @@
     "alias" : "UPDATE_PASSWORD",
     "name" : "Update Password",
     "providerId" : "UPDATE_PASSWORD",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 57,
     "config" : { }
@@ -2170,7 +2170,7 @@
     "alias" : "webauthn-register",
     "name" : "Webauthn Register",
     "providerId" : "webauthn-register",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 80,
     "config" : { }
@@ -2178,7 +2178,7 @@
     "alias" : "webauthn-register-passwordless",
     "name" : "Webauthn Register Passwordless",
     "providerId" : "webauthn-register-passwordless",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 90,
     "config" : { }
@@ -2186,7 +2186,7 @@
     "alias" : "VERIFY_PROFILE",
     "name" : "Verify Profile",
     "providerId" : "VERIFY_PROFILE",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 100,
     "config" : { }
@@ -2194,7 +2194,7 @@
     "alias" : "delete_credential",
     "name" : "Delete Credential",
     "providerId" : "delete_credential",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 110,
     "config" : { }
@@ -2202,7 +2202,7 @@
     "alias" : "idp_link",
     "name" : "Linking Identity Provider",
     "providerId" : "idp_link",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 120,
     "config" : { }
@@ -2210,7 +2210,7 @@
     "alias" : "CONFIGURE_RECOVERY_AUTHN_CODES",
     "name" : "Recovery Authentication Codes",
     "providerId" : "CONFIGURE_RECOVERY_AUTHN_CODES",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 130,
     "config" : { }
@@ -2218,7 +2218,7 @@
     "alias" : "update_user_locale",
     "name" : "Update User Locale",
     "providerId" : "update_user_locale",
-    "enabled" : true,
+    "enabled" : false,
     "defaultAction" : false,
     "priority" : 1000,
     "config" : { }

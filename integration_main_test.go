@@ -16,7 +16,7 @@ const (
 	testRealm        = "integration-test"
 	testClientID     = "go-auth-test"
 	testClientSecret = "test-client-secret"
-	testRedirectURL  = "http://localhost:8081/callback"
+	testRedirectURL  = "http://127.0.0.1:8081/callback"
 )
 
 var integrationEnvironment struct {
@@ -32,7 +32,7 @@ func TestMain(m *testing.M) {
 			fmt.Println("Panic")
 		}
 	}()
-	integrationEnvironment.IssuerURL = "http://localhost:8080/realms/integration-test"
+	integrationEnvironment.IssuerURL = "http://127.0.0.1:8080/realms/integration-test"
 	setup()
 	code := m.Run()
 	shutDown()
