@@ -26,42 +26,82 @@ var integrationEnvironment struct {
 var keycloakContainer *keycloak.KeycloakContainer
 
 func TestMain(m *testing.M) {
-	defer func() {
-		if r := recover(); r != nil {
-			shutDown()
-			fmt.Println("Panic")
+	exitCode := runIntegrationTests(m)
+	os.Exit(exitCode)
+}
+
+func runIntegrationTests(m *testing.M) int {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		2*time.Minute,
+	)
+	defer cancel()
+
+	container, err := runKeycloakContainer(ctx)
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"start Keycloak integration container: %v\n",
+			err,
+		)
+		return 1
+	}
+
+	keycloakContainer = container
+	integrationEnvironment.IssuerURL =
+		"http://127.0.0.1:8080/realms/" + testRealm
+
+	exitCode := m.Run()
+
+	cleanupContext, cleanupCancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cleanupCancel()
+
+	if err := keycloakContainer.Terminate(cleanupContext); err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"terminate Keycloak integration container: %v\n",
+			err,
+		)
+
+		if exitCode == 0 {
+			exitCode = 1
 		}
-	}()
-	integrationEnvironment.IssuerURL = "http://127.0.0.1:8080/realms/integration-test"
-	setup()
-	code := m.Run()
-	shutDown()
-	os.Exit(code)
-}
-
-func setup() {
-	var err error
-	ctx := context.Background()
-	keycloakContainer, err = RunContainer(ctx)
-	if err != nil {
-		panic(err)
 	}
+
+	return exitCode
 }
 
-func shutDown() {
-	ctx := context.Background()
-	err := keycloakContainer.Terminate(ctx)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func RunContainer(ctx context.Context) (*keycloak.KeycloakContainer, error) {
-	return keycloak.Run(ctx,
+func runKeycloakContainer(
+	ctx context.Context,
+) (*keycloak.KeycloakContainer, error) {
+	return keycloak.Run(
+		ctx,
 		"quay.io/keycloak/keycloak:26.7.0",
-		testcontainers.WithWaitStrategy(wait.ForListeningPort("8080/tcp").WithStartupTimeout(60*time.Second)),
+
+		testcontainers.WithWaitStrategy(
+			wait.ForHTTP(
+				"/realms/"+
+					testRealm+
+					"/.well-known/openid-configuration",
+			).
+				WithPort("8080/tcp").
+				WithStatusCodeMatcher(
+					func(status int) bool {
+						return status == 200
+					},
+				).
+				WithStartupTimeout(90*time.Second),
+		),
+
 		keycloak.WithContextPath(""),
-		keycloak.WithRealmImportFile("./test_data/integration_test_realm.json"),
+
+		keycloak.WithRealmImportFile(
+			"./test_data/integration_test_realm.json",
+		),
+
 		keycloak.WithAdminUsername("admin"),
 		keycloak.WithAdminPassword("admin"),
 	)

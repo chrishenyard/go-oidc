@@ -18,6 +18,7 @@ var (
 	ErrMissingRefreshToken  = errors.New("refresh token is missing")
 	ErrTokenRefresh         = errors.New("token refresh failed")
 	ErrInsufficientRole     = errors.New("insufficient role")
+	ErrInsufficientScope    = errors.New("insufficient scope")
 )
 
 // Error is an error returned by the auth package.
@@ -50,12 +51,7 @@ func (e *Error) Unwrap() error {
 	return e.Err
 }
 
-func wrapError(
-	operation string,
-	code string,
-	message string,
-	err error,
-) error {
+func wrapError(operation, code, message string, err error) error {
 	return &Error{
 		Operation: operation,
 		Code:      code,
@@ -65,26 +61,16 @@ func wrapError(
 }
 
 // ErrorHandler translates package errors into HTTP responses.
-//
 // Applications can replace this function through Config.ErrorHandler.
-type ErrorHandler func(
-	w http.ResponseWriter,
-	r *http.Request,
-	err error,
-)
+type ErrorHandler func(w http.ResponseWriter, r *http.Request, err error)
 
-func DefaultErrorHandler(
-	w http.ResponseWriter,
-	_ *http.Request,
-	err error,
-) {
+func DefaultErrorHandler(w http.ResponseWriter, _ *http.Request, err error) {
 	status := http.StatusInternalServerError
 	message := "internal authentication error"
 
 	switch {
 	case errors.Is(err, ErrInvalidState),
 		errors.Is(err, ErrMissingCode):
-
 		status = http.StatusBadRequest
 		message = "invalid authentication request"
 
@@ -94,13 +80,12 @@ func DefaultErrorHandler(
 		errors.Is(err, ErrMissingIDToken),
 		errors.Is(err, ErrMissingRefreshToken),
 		errors.Is(err, ErrTokenRefresh):
-
 		status = http.StatusUnauthorized
 		message = "authentication required"
 
 	case errors.Is(err, ErrInsufficientRole),
+		errors.Is(err, ErrInsufficientScope),
 		errors.Is(err, ErrAuthorization):
-
 		status = http.StatusForbidden
 		message = "access denied"
 

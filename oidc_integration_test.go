@@ -54,11 +54,25 @@ func newIntegrationAuthClient(
 			ClientSecret: testClientSecret,
 			RedirectURL:  testRedirectURL,
 
-			Scopes: []string{
-				"openid",
+			RequestedScopes: []string{
 				"profile",
 				"email",
 				"roles",
+			},
+
+			Authorization: auth.AuthorizationConfig{
+				// These paths are conventions, not provider-specific parsing.
+				// The package normalizes whichever claims are present.
+				RoleClaimPaths: []string{
+					"roles",
+					"groups",
+					"realm_access.roles",
+					"resource_access.{client_id}.roles",
+				},
+				ScopeClaimPaths: []string{
+					"scope",
+					"scp",
+				},
 			},
 
 			Store: store,
@@ -608,33 +622,23 @@ func TestRequireAuthentication_WithValidSession_AllowsRequest(
 		) {
 			handlerCalled = true
 
-			claims, ok := auth.ClaimsFromContext(
+			principal, ok := auth.PrincipalFromContext(
 				r.Context(),
 			)
 			if !ok {
 				t.Error(
-					"expected authenticated claims in request context",
+					"expected authenticated principal in request context",
 				)
 
 				http.Error(
 					w,
-					"claims unavailable",
+					"principal unavailable",
 					http.StatusInternalServerError,
 				)
 				return
 			}
 
-			if claims.Subject == "" {
-				t.Error("expected nonempty subject claim")
-			}
-
-			if claims.Email != testEmail {
-				t.Errorf(
-					"expected email %q, got %q",
-					testEmail,
-					claims.Email,
-				)
-			}
+			assertTestPrincipal(t, principal)
 
 			w.WriteHeader(http.StatusOK)
 
@@ -725,6 +729,78 @@ func TestRequireAuthentication_WithValidSession_AllowsRequest(
 			"expected stored ID token after protected request",
 		)
 	}
+}
+
+func TestRequireAuthentication_NormalizesScopesAndRoles(
+	t *testing.T,
+) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	store := auth.NewMemoryStore()
+	client := newIntegrationAuthClient(t, ctx, store)
+
+	authenticatedSession := authenticateTestUser(
+		t,
+		ctx,
+		client,
+		store,
+		testUsername,
+		testPassword,
+	)
+
+	var captured auth.Principal
+
+	handler := client.RequireAuthentication(
+		http.HandlerFunc(
+			func(
+				w http.ResponseWriter,
+				r *http.Request,
+			) {
+				principal, ok := auth.PrincipalFromContext(
+					r.Context(),
+				)
+				if !ok {
+					http.Error(
+						w,
+						"principal unavailable",
+						http.StatusInternalServerError,
+					)
+					return
+				}
+
+				captured = principal
+				w.WriteHeader(http.StatusNoContent)
+			},
+		),
+	)
+
+	result := executeHandler(
+		t,
+		handler,
+		http.MethodGet,
+		testApplicationURL+"/principal",
+		[]*http.Cookie{
+			authenticatedSession.SessionCookie,
+		},
+	)
+	defer result.Body.Close()
+
+	if result.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(result.Body)
+
+		t.Fatalf(
+			"expected status %d, got %d: %s",
+			http.StatusNoContent,
+			result.StatusCode,
+			string(body),
+		)
+	}
+
+	assertTestPrincipal(t, captured)
 }
 
 func executeHandler(
@@ -1013,6 +1089,14 @@ func assertAuthenticatedSession(
 		t.Error("expected raw ID token")
 	}
 
+	assertContainsAll(
+		t,
+		session.GrantedScopes,
+		"openid",
+		"profile",
+		"email",
+	)
+
 	if session.ExpiresAt.IsZero() {
 		t.Error("expected application session expiration")
 	} else if !session.ExpiresAt.After(time.Now()) {
@@ -1051,6 +1135,68 @@ func assertOpaqueSessionCookie(
 		session.RawIDToken,
 	) {
 		t.Error("session cookie contains ID token")
+	}
+}
+
+func assertTestPrincipal(
+	t *testing.T,
+	principal auth.Principal,
+) {
+	t.Helper()
+
+	t.Logf("principal roles: %#v", principal.Roles)
+	t.Logf("principal scopes: %#v", principal.Scopes)
+	t.Logf("principal claims: %#v", principal.Claims)
+
+	if principal.Subject == "" {
+		t.Error("expected nonempty subject")
+	}
+
+	if principal.Email != testEmail {
+		t.Errorf(
+			"expected email %q, got %q",
+			testEmail,
+			principal.Email,
+		)
+	}
+
+	assertContainsAll(
+		t,
+		principal.Scopes,
+		"openid",
+		"profile",
+		"email",
+	)
+
+	// The imported integration realm assigns alice the user role.
+	if !principal.HasRole("user") {
+		t.Errorf(
+			"expected normalized role %q in %v",
+			"user",
+			principal.Roles,
+		)
+	}
+
+	if principal.Claims == nil {
+		t.Error("expected raw merged claims")
+	}
+}
+
+func assertContainsAll(
+	t *testing.T,
+	actual []string,
+	expected ...string,
+) {
+	t.Helper()
+
+	for _, value := range expected {
+		if !contains(actual, value) {
+			t.Errorf(
+				"expected %q in %v",
+				value,
+				actual,
+			)
+		}
 	}
 }
 
