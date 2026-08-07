@@ -33,18 +33,28 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
+	base := ""
+
 	switch {
 	case e.Operation != "" && e.Message != "":
-		return fmt.Sprintf("%s: %s", e.Operation, e.Message)
+		base = fmt.Sprintf("%s: %s", e.Operation, e.Message)
 	case e.Operation != "":
-		return e.Operation
+		base = e.Operation
 	case e.Message != "":
-		return e.Message
-	case e.Err != nil:
-		return e.Err.Error()
+		base = e.Message
 	default:
-		return "authentication error"
+		base = "authentication error"
 	}
+
+	if e.Err == nil {
+		return base
+	}
+
+	if base != "" {
+		return fmt.Sprintf("%s: cause=%T: %v", base, e.Err, e.Err)
+	}
+
+	return fmt.Sprintf("cause=%T: %v", e.Err, e.Err)
 }
 
 func (e *Error) Unwrap() error {
