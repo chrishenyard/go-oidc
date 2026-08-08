@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 )
 
@@ -46,14 +47,30 @@ func (c *Client) RequireScope(requiredScope string, next http.Handler) http.Hand
 // builds a provider-independent Principal, and optionally invokes authorize.
 func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.logger.Debug("auth middleware started",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+		)
+
 		principal, err := c.authenticateRequest(w, r)
 		if err != nil {
+			c.logger.Debug("request authentication failed",
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("error", err.Error()),
+			)
 			c.errorHandler(w, r, err)
 			return
 		}
 
 		if authorize != nil {
 			if err := authorize(principal); err != nil {
+				c.logger.Debug("request authorization failed",
+					slog.String("method", r.Method),
+					slog.String("path", r.URL.Path),
+					slog.String("subject", principal.Subject),
+					slog.String("error", err.Error()),
+				)
 				c.errorHandler(
 					w,
 					r,
@@ -68,6 +85,12 @@ func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Han
 			}
 		}
 
+		c.logger.Debug("auth middleware passed",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("subject", principal.Subject),
+		)
+
 		ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -76,8 +99,19 @@ func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Han
 func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Principal, error) {
 	const operation = "auth.Client.authenticateRequest"
 
+	c.logger.Debug("authenticating request",
+		slog.String("operation", operation),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	sessionID, err := readCookieValue(r, c.sessionCookieName)
 	if err != nil {
+		c.logger.Debug("session cookie not found",
+			slog.String("operation", operation),
+			slog.String("cookie_name", c.sessionCookieName),
+			slog.String("error", err.Error()),
+		)
 		return Principal{}, wrapError(
 			operation,
 			"session_cookie_missing",
@@ -88,6 +122,10 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	session, err := c.store.GetSession(r.Context(), sessionID)
 	if err != nil {
+		c.logger.Debug("session lookup failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		c.clearCookie(w, c.sessionCookieName)
 		return Principal{}, wrapError(
 			operation,
@@ -99,13 +137,24 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	refreshedSession, err := c.refreshSession(r.Context(), session)
 	if err != nil {
+		c.logger.Debug("session refresh failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		_ = c.store.DeleteSession(context.Background(), sessionID)
 		c.clearCookie(w, c.sessionCookieName)
 		return Principal{}, err
 	}
 
 	if sessionChanged(session, refreshedSession) {
+		c.logger.Debug("session changed after refresh",
+			slog.String("operation", operation),
+		)
 		if err := c.store.SaveSession(r.Context(), sessionID, refreshedSession); err != nil {
+			c.logger.Debug("failed to persist refreshed session",
+				slog.String("operation", operation),
+				slog.String("error", err.Error()),
+			)
 			return Principal{}, wrapError(
 				operation,
 				"session_update_failed",
@@ -117,6 +166,10 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	idToken, err := c.verifier.Verify(r.Context(), refreshedSession.RawIDToken)
 	if err != nil {
+		c.logger.Debug("id token verification failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		_ = c.store.DeleteSession(context.Background(), sessionID)
 		c.clearCookie(w, c.sessionCookieName)
 		return Principal{}, wrapError(
@@ -129,14 +182,30 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	principal, err := c.buildPrincipal(r.Context(), idToken, refreshedSession)
 	if err != nil {
+		c.logger.Debug("principal construction failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return Principal{}, err
 	}
+
+	c.logger.Debug("request authenticated",
+		slog.String("operation", operation),
+		slog.String("subject", principal.Subject),
+		slog.Int("role_count", len(principal.Roles)),
+		slog.Int("scope_count", len(principal.Scopes)),
+	)
 
 	return principal, nil
 }
 
 func (c *Client) refreshSession(ctx context.Context, session Session) (Session, error) {
 	const operation = "auth.Client.refreshSession"
+
+	c.logger.Debug("refreshing OAuth token",
+		slog.String("operation", operation),
+		slog.Bool("token_present", session.Token != nil),
+	)
 
 	if session.Token == nil {
 		return Session{}, wrapError(
@@ -150,6 +219,10 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	previousToken := session.Token
 	currentToken, err := c.oauth2Config.TokenSource(ctx, previousToken).Token()
 	if err != nil {
+		c.logger.Debug("OAuth token refresh failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return Session{}, wrapError(
 			operation,
 			"token_refresh_failed",
@@ -167,8 +240,15 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 
 	accessTokenChanged := currentToken.AccessToken != previousToken.AccessToken
 	if !accessTokenChanged {
+		c.logger.Debug("existing access token is still valid",
+			slog.String("operation", operation),
+		)
 		return updated, nil
 	}
+
+	c.logger.Debug("access token changed, validating refreshed ID token",
+		slog.String("operation", operation),
+	)
 
 	rawIDToken, err := getIDToken(currentToken)
 	if err != nil {
@@ -181,6 +261,10 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	}
 
 	if _, err := c.verifier.Verify(ctx, rawIDToken); err != nil {
+		c.logger.Debug("refreshed ID token verification failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return Session{}, wrapError(
 			operation,
 			"refreshed_id_token_invalid",
@@ -190,6 +274,10 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	}
 
 	updated.RawIDToken = rawIDToken
+	c.logger.Debug("session refresh completed",
+		slog.String("operation", operation),
+		slog.Int("granted_scope_count", len(updated.GrantedScopes)),
+	)
 	return updated, nil
 }
 

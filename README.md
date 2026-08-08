@@ -20,6 +20,7 @@ The authentication package handles:
 * Login, callback, and logout handlers
 * Typed library errors
 * Configurable HTTP error handling
+* Optional debug logging with `log/slog`
 
 The example is configured to use Keycloak, but the package can work with other standards-compliant OpenID Connect providers.
 
@@ -255,9 +256,68 @@ if errors.As(err, &authError) {
 }
 ```
 
-The authentication package does not terminate the process or write logs directly.
+The authentication package does not terminate the process.
 
-The application decides how errors should be logged and presented.
+The application decides where logs are written and can enable package debug logs by providing a `*slog.Logger` in `auth.Config`.
+
+## Debug Logging With slog
+
+The auth package emits debug-level lifecycle events (login, callback, token refresh, middleware authentication/authorization, and logout) when a logger is configured.
+
+If `Config.Logger` is nil, logging is disabled.
+
+```go
+package main
+
+import (
+    "context"
+    "log/slog"
+    "net/http"
+    "os"
+
+    auth "github.com/chrishenyard/go-oidc"
+)
+
+func main() {
+    logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelDebug,
+    }))
+
+    client, err := auth.New(context.Background(), auth.Config{
+        IssuerURL:    "http://localhost:8080/realms/my-realm",
+        ClientID:     "my-client",
+        ClientSecret: "my-secret",
+        RedirectURL:  "http://localhost:8081/callback",
+        Store:        auth.NewMemoryStore(),
+        Logger:       logger,
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    http.Handle("/login", client.LoginHandler())
+    http.Handle("/callback", client.CallbackHandler())
+    http.Handle("/logout", client.LogoutHandler())
+
+    http.Handle(
+        "/api/admin",
+        client.RequireRole("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.WriteHeader(http.StatusOK)
+            _, _ = w.Write([]byte("ok"))
+        })),
+    )
+
+    _ = http.ListenAndServe(":8081", nil)
+}
+```
+
+Example debug log lines:
+
+```text
+time=2026-08-08T12:00:00.123Z level=DEBUG msg="auth middleware started" method=GET path=/api/admin
+time=2026-08-08T12:00:00.124Z level=DEBUG msg="authenticating request" operation=auth.Client.authenticateRequest method=GET path=/api/admin
+time=2026-08-08T12:00:00.130Z level=DEBUG msg="request authenticated" operation=auth.Client.authenticateRequest subject=7f3f1a4b role_count=2 scope_count=3
+```
 
 ## Requirements
 

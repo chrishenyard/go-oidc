@@ -6,6 +6,8 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -66,6 +68,10 @@ type Config struct {
 	ClientSecret string
 	RedirectURL  string
 
+	// Logger receives debug-level lifecycle events from the auth package.
+	// When nil, logging is disabled.
+	Logger *slog.Logger
+
 	// RequestedScopes contains additional scopes requested by the application.
 	// The package always includes openid and defaults to profile and email when
 	// this field is empty.
@@ -92,6 +98,7 @@ type Client struct {
 	provider     *oidc.Provider
 	verifier     *oidc.IDTokenVerifier
 	store        Store
+	logger       *slog.Logger
 
 	authorization AuthorizationConfig
 
@@ -181,6 +188,11 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		errorHandler = DefaultErrorHandler
 	}
 
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
 	return &Client{
 		oauth2Config: oauth2.Config{
 			ClientID:     config.ClientID,
@@ -194,6 +206,7 @@ func New(ctx context.Context, config Config) (*Client, error) {
 			ClientID: config.ClientID,
 		}),
 		store:         config.Store,
+		logger:        logger,
 		authorization: authorization,
 
 		transactionCookieName: transactionCookieName,
@@ -267,6 +280,12 @@ func (c *Client) LogoutHandler() http.Handler {
 func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.beginLogin"
 
+	c.logger.Debug("starting OIDC login flow",
+		slog.String("operation", operation),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	transactionID, err := generateRandomValue(32)
 	if err != nil {
 		return wrapError(operation, "transaction_id_generation_failed", "could not generate transaction ID", err)
@@ -284,6 +303,10 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if err := c.store.SaveTransaction(r.Context(), transactionID, transaction); err != nil {
+		c.logger.Debug("failed to persist login transaction",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return wrapError(operation, "transaction_save_failed", "could not save authorization transaction", err)
 	}
 
@@ -295,6 +318,12 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 		oidc.Nonce(nonce),
 	)
 
+	c.logger.Debug("redirecting to provider authorization endpoint",
+		slog.String("operation", operation),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	http.Redirect(w, r, authorizationURL, http.StatusFound)
 	return nil
 }
@@ -302,7 +331,17 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.completeLogin"
 
+	c.logger.Debug("handling OIDC callback",
+		slog.String("operation", operation),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	if authorizationError := r.URL.Query().Get("error"); authorizationError != "" {
+		c.logger.Debug("provider returned authorization error",
+			slog.String("operation", operation),
+			slog.String("provider_error", authorizationError),
+		)
 		return wrapError(
 			operation,
 			"provider_authorization_failed",
@@ -313,6 +352,10 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	transactionID, err := readCookieValue(r, c.transactionCookieName)
 	if err != nil {
+		c.logger.Debug("missing authorization transaction cookie",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return wrapError(
 			operation,
 			"transaction_cookie_missing",
@@ -327,6 +370,10 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	transaction, err := c.store.GetTransaction(r.Context(), transactionID)
 	if err != nil {
+		c.logger.Debug("authorization transaction lookup failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return wrapError(
 			operation,
 			"transaction_not_found",
@@ -337,6 +384,10 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	receivedState := r.URL.Query().Get("state")
 	if receivedState == "" || !constantTimeEqual(receivedState, transaction.State) {
+		c.logger.Debug("state validation failed",
+			slog.String("operation", operation),
+			slog.Bool("state_present", receivedState != ""),
+		)
 		return wrapError(operation, "invalid_state", "OAuth state did not match", ErrInvalidState)
 	}
 
@@ -351,6 +402,10 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 		oauth2.VerifierOption(transaction.PKCEVerifier),
 	)
 	if err != nil {
+		c.logger.Debug("authorization code exchange failed",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return wrapError(
 			operation,
 			"code_exchange_failed",
@@ -400,8 +455,17 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if err := c.store.SaveSession(r.Context(), sessionID, session); err != nil {
+		c.logger.Debug("failed to save authenticated session",
+			slog.String("operation", operation),
+			slog.String("error", err.Error()),
+		)
 		return wrapError(operation, "session_save_failed", "could not save authenticated session", err)
 	}
+
+	c.logger.Debug("OIDC login completed",
+		slog.String("operation", operation),
+		slog.Int("granted_scope_count", len(session.GrantedScopes)),
+	)
 
 	c.clearCookie(w, c.transactionCookieName)
 	c.setCookie(w, c.sessionCookieName, sessionID, c.sessionLifetime)
@@ -412,11 +476,25 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.logout"
 
+	c.logger.Debug("processing logout",
+		slog.String("operation", operation),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	sessionID, err := readCookieValue(r, c.sessionCookieName)
 	if err == nil {
 		if deleteErr := c.store.DeleteSession(r.Context(), sessionID); deleteErr != nil {
+			c.logger.Debug("failed to delete session during logout",
+				slog.String("operation", operation),
+				slog.String("error", deleteErr.Error()),
+			)
 			return wrapError(operation, "session_delete_failed", "could not delete session", deleteErr)
 		}
+
+		c.logger.Debug("session deleted during logout",
+			slog.String("operation", operation),
+		)
 	}
 
 	c.clearCookie(w, c.sessionCookieName)
