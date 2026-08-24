@@ -70,7 +70,7 @@ type Config struct {
 
 	// Logger receives debug-level lifecycle events from the auth package.
 	// When nil, logging is disabled.
-	LoggerFromContext func(context.Context) *slog.Logger
+	Logger *slog.Logger
 
 	// RequestedScopes contains additional scopes requested by the application.
 	// The package always includes openid and defaults to profile and email when
@@ -94,11 +94,11 @@ type Config struct {
 }
 
 type Client struct {
-	oauth2Config      oauth2.Config
-	provider          *oidc.Provider
-	verifier          *oidc.IDTokenVerifier
-	store             Store
-	loggerFromContext func(context.Context) *slog.Logger
+	oauth2Config oauth2.Config
+	provider     *oidc.Provider
+	verifier     *oidc.IDTokenVerifier
+	store        Store
+	logger       *slog.Logger
 
 	authorization AuthorizationConfig
 
@@ -188,10 +188,9 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		errorHandler = DefaultErrorHandler
 	}
 
-	loggerFromContext := config.LoggerFromContext
-	if loggerFromContext == nil {
-		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		loggerFromContext = func(context.Context) *slog.Logger { return logger }
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	return &Client{
@@ -206,9 +205,9 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		verifier: provider.Verifier(&oidc.Config{
 			ClientID: config.ClientID,
 		}),
-		store:             config.Store,
-		loggerFromContext: loggerFromContext,
-		authorization:     authorization,
+		store:         config.Store,
+		logger:        logger,
+		authorization: authorization,
 
 		transactionCookieName: transactionCookieName,
 		sessionCookieName:     sessionCookieName,
@@ -219,15 +218,6 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		loginSuccessURL:       successURL,
 		errorHandler:          errorHandler,
 	}, nil
-}
-
-func (c *Client) loggerFor(ctx context.Context) *slog.Logger {
-	if c.loggerFromContext != nil {
-		if logger := c.loggerFromContext(ctx); logger != nil {
-			return logger
-		}
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func normalizeRequestedScopes(requested []string) []string {
@@ -289,9 +279,8 @@ func (c *Client) LogoutHandler() http.Handler {
 
 func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.beginLogin"
-	logger := c.loggerFor(r.Context())
 
-	logger.Debug("starting OIDC login flow",
+	c.logger.Debug("starting OIDC login flow",
 		slog.String("operation", operation),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
@@ -314,7 +303,7 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if err := c.store.SaveTransaction(r.Context(), transactionID, transaction); err != nil {
-		logger.Debug("failed to persist login transaction",
+		c.logger.Debug("failed to persist login transaction",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -329,7 +318,7 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 		oidc.Nonce(nonce),
 	)
 
-	logger.Debug("redirecting to provider authorization endpoint",
+	c.logger.Debug("redirecting to provider authorization endpoint",
 		slog.String("operation", operation),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
@@ -342,15 +331,14 @@ func (c *Client) beginLogin(w http.ResponseWriter, r *http.Request) error {
 func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.completeLogin"
 
-	logger := c.loggerFor(r.Context())
-	logger.Debug("handling OIDC callback",
+	c.logger.Debug("handling OIDC callback",
 		slog.String("operation", operation),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
 	)
 
 	if authorizationError := r.URL.Query().Get("error"); authorizationError != "" {
-		logger.Debug("provider returned authorization error",
+		c.logger.Debug("provider returned authorization error",
 			slog.String("operation", operation),
 			slog.String("provider_error", authorizationError),
 		)
@@ -364,7 +352,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	transactionID, err := readCookieValue(r, c.transactionCookieName)
 	if err != nil {
-		logger.Debug("missing authorization transaction cookie",
+		c.logger.Debug("missing authorization transaction cookie",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -382,7 +370,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	transaction, err := c.store.GetTransaction(r.Context(), transactionID)
 	if err != nil {
-		logger.Debug("authorization transaction lookup failed",
+		c.logger.Debug("authorization transaction lookup failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -396,7 +384,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 	receivedState := r.URL.Query().Get("state")
 	if receivedState == "" || !constantTimeEqual(receivedState, transaction.State) {
-		logger.Debug("state validation failed",
+		c.logger.Debug("state validation failed",
 			slog.String("operation", operation),
 			slog.Bool("state_present", receivedState != ""),
 		)
@@ -414,7 +402,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 		oauth2.VerifierOption(transaction.PKCEVerifier),
 	)
 	if err != nil {
-		logger.Debug("authorization code exchange failed",
+		c.logger.Debug("authorization code exchange failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -467,14 +455,14 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if err := c.store.SaveSession(r.Context(), sessionID, session); err != nil {
-		logger.Debug("failed to save authenticated session",
+		c.logger.Debug("failed to save authenticated session",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
 		return wrapError(operation, "session_save_failed", "could not save authenticated session", err)
 	}
 
-	logger.Debug("OIDC login completed",
+	c.logger.Debug("OIDC login completed",
 		slog.String("operation", operation),
 		slog.Int("granted_scope_count", len(session.GrantedScopes)),
 	)
@@ -487,9 +475,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 
 func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
 	const operation = "auth.Client.logout"
-	logger := c.loggerFor(r.Context())
-
-	logger.Debug("processing logout",
+	c.logger.Debug("processing logout",
 		slog.String("operation", operation),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
@@ -498,14 +484,14 @@ func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
 	sessionID, err := readCookieValue(r, c.sessionCookieName)
 	if err == nil {
 		if deleteErr := c.store.DeleteSession(r.Context(), sessionID); deleteErr != nil {
-			logger.Debug("failed to delete session during logout",
+			c.logger.Debug("failed to delete session during logout",
 				slog.String("operation", operation),
 				slog.String("error", deleteErr.Error()),
 			)
 			return wrapError(operation, "session_delete_failed", "could not delete session", deleteErr)
 		}
 
-		logger.Debug("session deleted during logout",
+		c.logger.Debug("session deleted during logout",
 			slog.String("operation", operation),
 		)
 	}

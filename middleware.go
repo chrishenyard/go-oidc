@@ -47,16 +47,14 @@ func (c *Client) RequireScope(requiredScope string, next http.Handler) http.Hand
 // builds a provider-independent Principal, and optionally invokes authorize.
 func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-		logger := c.loggerFor(r.Context())
-		logger.Debug("auth middleware started",
+		c.logger.Debug("auth middleware started",
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
 		)
 
 		principal, err := c.authenticateRequest(w, r)
 		if err != nil {
-			logger.Debug("request authentication failed",
+			c.logger.Debug("request authentication failed",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.String("error", err.Error()),
@@ -67,7 +65,7 @@ func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Han
 
 		if authorize != nil {
 			if err := authorize(principal); err != nil {
-				logger.Debug("request authorization failed",
+				c.logger.Debug("request authorization failed",
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
 					slog.String("subject", principal.Subject),
@@ -87,7 +85,7 @@ func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Han
 			}
 		}
 
-		logger.Debug("auth middleware passed",
+		c.logger.Debug("auth middleware passed",
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
 			slog.String("subject", principal.Subject),
@@ -101,8 +99,7 @@ func (c *Client) Middleware(authorize AuthorizeFunc, next http.Handler) http.Han
 func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Principal, error) {
 	const operation = "auth.Client.authenticateRequest"
 
-	logger := c.loggerFor(r.Context())
-	logger.Debug("authenticating request",
+	c.logger.Debug("authenticating request",
 		slog.String("operation", operation),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
@@ -110,7 +107,7 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	sessionID, err := readCookieValue(r, c.sessionCookieName)
 	if err != nil {
-		logger.Debug("session cookie not found",
+		c.logger.Debug("session cookie not found",
 			slog.String("operation", operation),
 			slog.String("cookie_name", c.sessionCookieName),
 			slog.String("error", err.Error()),
@@ -125,7 +122,7 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	session, err := c.store.GetSession(r.Context(), sessionID)
 	if err != nil {
-		logger.Debug("session lookup failed",
+		c.logger.Debug("session lookup failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -140,7 +137,7 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	refreshedSession, err := c.refreshSession(r.Context(), session)
 	if err != nil {
-		logger.Debug("session refresh failed",
+		c.logger.Debug("session refresh failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -150,11 +147,11 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 	}
 
 	if sessionChanged(session, refreshedSession) {
-		logger.Debug("session changed after refresh",
+		c.logger.Debug("session changed after refresh",
 			slog.String("operation", operation),
 		)
 		if err := c.store.SaveSession(r.Context(), sessionID, refreshedSession); err != nil {
-			logger.Debug("failed to persist refreshed session",
+			c.logger.Debug("failed to persist refreshed session",
 				slog.String("operation", operation),
 				slog.String("error", err.Error()),
 			)
@@ -169,7 +166,7 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	idToken, err := c.verifier.Verify(r.Context(), refreshedSession.RawIDToken)
 	if err != nil {
-		logger.Debug("id token verification failed",
+		c.logger.Debug("id token verification failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -185,14 +182,14 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 	principal, err := c.buildPrincipal(r.Context(), idToken, refreshedSession)
 	if err != nil {
-		logger.Debug("principal construction failed",
+		c.logger.Debug("principal construction failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
 		return Principal{}, err
 	}
 
-	logger.Debug("request authenticated",
+	c.logger.Debug("request authenticated",
 		slog.String("operation", operation),
 		slog.String("subject", principal.Subject),
 		slog.Int("role_count", len(principal.Roles)),
@@ -204,9 +201,7 @@ func (c *Client) authenticateRequest(w http.ResponseWriter, r *http.Request) (Pr
 
 func (c *Client) refreshSession(ctx context.Context, session Session) (Session, error) {
 	const operation = "auth.Client.refreshSession"
-	logger := c.loggerFor(ctx)
-
-	logger.Debug("refreshing OAuth token",
+	c.logger.Debug("refreshing OAuth token",
 		slog.String("operation", operation),
 		slog.Bool("token_present", session.Token != nil),
 	)
@@ -223,7 +218,7 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	previousToken := session.Token
 	currentToken, err := c.oauth2Config.TokenSource(ctx, previousToken).Token()
 	if err != nil {
-		logger.Debug("OAuth token refresh failed",
+		c.logger.Debug("OAuth token refresh failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -244,13 +239,13 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 
 	accessTokenChanged := currentToken.AccessToken != previousToken.AccessToken
 	if !accessTokenChanged {
-		logger.Debug("existing access token is still valid",
+		c.logger.Debug("existing access token is still valid",
 			slog.String("operation", operation),
 		)
 		return updated, nil
 	}
 
-	logger.Debug("access token changed, validating refreshed ID token",
+	c.logger.Debug("access token changed, validating refreshed ID token",
 		slog.String("operation", operation),
 	)
 
@@ -265,7 +260,7 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	}
 
 	if _, err := c.verifier.Verify(ctx, rawIDToken); err != nil {
-		logger.Debug("refreshed ID token verification failed",
+		c.logger.Debug("refreshed ID token verification failed",
 			slog.String("operation", operation),
 			slog.String("error", err.Error()),
 		)
@@ -278,7 +273,7 @@ func (c *Client) refreshSession(ctx context.Context, session Session) (Session, 
 	}
 
 	updated.RawIDToken = rawIDToken
-	logger.Debug("session refresh completed",
+	c.logger.Debug("session refresh completed",
 		slog.String("operation", operation),
 		slog.Int("granted_scope_count", len(updated.GrantedScopes)),
 	)
