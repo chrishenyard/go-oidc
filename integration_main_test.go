@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,8 +49,18 @@ func runIntegrationTests(m *testing.M) int {
 	}
 
 	keycloakContainer = container
+	authServerURL, err := container.GetAuthServerURL(ctx)
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"get Keycloak auth server URL: %v\n",
+			err,
+		)
+		return 1
+	}
+
 	integrationEnvironment.IssuerURL =
-		"http://127.0.0.1:8080/realms/" + testRealm
+		strings.TrimRight(authServerURL, "/") + "/realms/" + testRealm
 
 	exitCode := m.Run()
 
