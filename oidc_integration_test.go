@@ -587,6 +587,153 @@ func TestCallback_CreatesAuthenticatedSession(t *testing.T) {
 	}
 }
 
+func TestLogoutHandler_EndsLocalSessionAndProviderSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	store := auth.NewMemoryStore()
+
+	client := newIntegrationAuthClient(
+		t,
+		ctx,
+		store,
+	)
+
+	authenticatedSession := authenticateTestUser(
+		t,
+		ctx,
+		client,
+		store,
+		testUsername,
+		testPassword,
+	)
+
+	rawIDToken := authenticatedSession.Session.RawIDToken
+
+	logoutResult := executeHandler(
+		t,
+		client.LogoutHandler(),
+		http.MethodGet,
+		testApplicationURL+"/logout",
+		[]*http.Cookie{authenticatedSession.SessionCookie},
+	)
+
+	assertStatus(t, logoutResult, http.StatusFound)
+
+	logoutLocation := requireHeader(
+		t,
+		logoutResult,
+		"Location",
+	)
+
+	// RP-initiated logout must reach the provider so its own SSO session
+	// ends too, otherwise a later login silently reauthenticates the user.
+	endSessionURL, err := url.Parse(logoutLocation)
+	if err != nil {
+		t.Fatalf("parse logout redirect URL: %v", err)
+	}
+
+	if !strings.Contains(endSessionURL.Path, "/protocol/openid-connect/logout") {
+		t.Errorf(
+			"expected redirect to Keycloak end-session endpoint, got %q",
+			logoutLocation,
+		)
+	}
+
+	query := endSessionURL.Query()
+
+	if got := query.Get("id_token_hint"); got != rawIDToken {
+		t.Errorf(
+			"expected id_token_hint %q, got %q",
+			rawIDToken,
+			got,
+		)
+	}
+
+	if query.Get("post_logout_redirect_uri") != "/dashboard" {
+		t.Errorf(
+			"expected post_logout_redirect_uri %q, got %q",
+			"/dashboard",
+			query.Get("post_logout_redirect_uri"),
+		)
+	}
+
+	clearedSessionCookie := requireCookie(
+		t,
+		logoutResult.Cookies(),
+		testSessionCookieName,
+	)
+
+	if clearedSessionCookie.MaxAge >= 0 {
+		t.Errorf(
+			"expected cleared session cookie MaxAge below zero, got %d",
+			clearedSessionCookie.MaxAge,
+		)
+	}
+
+	_, err = store.GetSession(
+		ctx,
+		authenticatedSession.SessionCookie.Value,
+	)
+	if !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Errorf(
+			"expected session to be deleted after logout, got %v",
+			err,
+		)
+	}
+}
+
+func TestLogoutHandler_WithoutSessionCookie_StillRedirectsToProvider(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
+	defer cancel()
+
+	store := auth.NewMemoryStore()
+
+	client := newIntegrationAuthClient(
+		t,
+		ctx,
+		store,
+	)
+
+	logoutResult := executeHandler(
+		t,
+		client.LogoutHandler(),
+		http.MethodGet,
+		testApplicationURL+"/logout",
+		nil,
+	)
+
+	assertStatus(t, logoutResult, http.StatusFound)
+
+	logoutLocation := requireHeader(
+		t,
+		logoutResult,
+		"Location",
+	)
+
+	endSessionURL, err := url.Parse(logoutLocation)
+	if err != nil {
+		t.Fatalf("parse logout redirect URL: %v", err)
+	}
+
+	if !strings.Contains(endSessionURL.Path, "/protocol/openid-connect/logout") {
+		t.Errorf(
+			"expected redirect to Keycloak end-session endpoint, got %q",
+			logoutLocation,
+		)
+	}
+
+	if endSessionURL.Query().Get("id_token_hint") != "" {
+		t.Error("expected no id_token_hint without an authenticated session")
+	}
+}
+
 func TestRequireAuthentication_WithValidSession_AllowsRequest(
 	t *testing.T,
 ) {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -90,15 +91,22 @@ type Config struct {
 	CookieSameSite http.SameSite
 
 	LoginSuccessURL string
-	ErrorHandler    ErrorHandler
+
+	// PostLogoutRedirectURL is where the provider redirects the browser after
+	// RP-initiated logout completes. It must be registered with the provider
+	// as an allowed post-logout redirect URI. Defaults to LoginSuccessURL.
+	PostLogoutRedirectURL string
+
+	ErrorHandler ErrorHandler
 }
 
 type Client struct {
-	oauth2Config oauth2.Config
-	provider     *oidc.Provider
-	verifier     *oidc.IDTokenVerifier
-	store        Store
-	logger       *slog.Logger
+	oauth2Config       oauth2.Config
+	provider           *oidc.Provider
+	verifier           *oidc.IDTokenVerifier
+	endSessionEndpoint string
+	store              Store
+	logger             *slog.Logger
 
 	authorization AuthorizationConfig
 
@@ -111,8 +119,9 @@ type Client struct {
 	cookieSecure   bool
 	cookieSameSite http.SameSite
 
-	loginSuccessURL string
-	errorHandler    ErrorHandler
+	loginSuccessURL       string
+	postLogoutRedirectURL string
+	errorHandler          ErrorHandler
 }
 
 func New(ctx context.Context, config Config) (*Client, error) {
@@ -150,6 +159,18 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		)
 	}
 
+	var discoveryClaims struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if err := provider.Claims(&discoveryClaims); err != nil {
+		return nil, wrapError(
+			operation,
+			"provider_discovery_failed",
+			"could not parse OIDC discovery document",
+			fmt.Errorf("%w: %v", ErrInvalidConfiguration, err),
+		)
+	}
+
 	scopes := normalizeRequestedScopes(config.RequestedScopes)
 	authorization := normalizeAuthorizationConfig(config.Authorization)
 
@@ -183,6 +204,11 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		successURL = "/"
 	}
 
+	postLogoutRedirectURL := config.PostLogoutRedirectURL
+	if postLogoutRedirectURL == "" {
+		postLogoutRedirectURL = successURL
+	}
+
 	errorHandler := config.ErrorHandler
 	if errorHandler == nil {
 		errorHandler = DefaultErrorHandler
@@ -205,9 +231,10 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		verifier: provider.Verifier(&oidc.Config{
 			ClientID: config.ClientID,
 		}),
-		store:         config.Store,
-		logger:        logger,
-		authorization: authorization,
+		endSessionEndpoint: discoveryClaims.EndSessionEndpoint,
+		store:              config.Store,
+		logger:             logger,
+		authorization:      authorization,
 
 		transactionCookieName: transactionCookieName,
 		sessionCookieName:     sessionCookieName,
@@ -216,6 +243,7 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		cookieSecure:          config.CookieSecure,
 		cookieSameSite:        sameSite,
 		loginSuccessURL:       successURL,
+		postLogoutRedirectURL: postLogoutRedirectURL,
 		errorHandler:          errorHandler,
 	}, nil
 }
@@ -269,11 +297,12 @@ func (c *Client) CallbackHandler() http.Handler {
 
 func (c *Client) LogoutHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := c.logout(w, r); err != nil {
+		redirectURL, err := c.logout(w, r)
+		if err != nil {
 			c.errorHandler(w, r, err)
 			return
 		}
-		http.Redirect(w, r, "/", http.StatusFound)
+		http.Redirect(w, r, redirectURL, http.StatusFound)
 	})
 }
 
@@ -473,7 +502,7 @@ func (c *Client) completeLogin(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
+func (c *Client) logout(w http.ResponseWriter, r *http.Request) (string, error) {
 	const operation = "auth.Client.logout"
 	c.logger.Debug("processing logout",
 		slog.String("operation", operation),
@@ -481,14 +510,20 @@ func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
 		slog.String("path", r.URL.Path),
 	)
 
+	var rawIDToken string
+
 	sessionID, err := readCookieValue(r, c.sessionCookieName)
 	if err == nil {
+		if session, getErr := c.store.GetSession(r.Context(), sessionID); getErr == nil {
+			rawIDToken = session.RawIDToken
+		}
+
 		if deleteErr := c.store.DeleteSession(r.Context(), sessionID); deleteErr != nil {
 			c.logger.Debug("failed to delete session during logout",
 				slog.String("operation", operation),
 				slog.String("error", deleteErr.Error()),
 			)
-			return wrapError(operation, "session_delete_failed", "could not delete session", deleteErr)
+			return "", wrapError(operation, "session_delete_failed", "could not delete session", deleteErr)
 		}
 
 		c.logger.Debug("session deleted during logout",
@@ -497,7 +532,26 @@ func (c *Client) logout(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	c.clearCookie(w, c.sessionCookieName)
-	return nil
+
+	// Ending only the local session lets the provider keep its own SSO
+	// session alive, so a subsequent login would silently re-authenticate
+	// the user without prompting for credentials. RP-initiated logout ends
+	// the provider session too.
+	return c.endSessionRedirectURL(rawIDToken), nil
+}
+
+func (c *Client) endSessionRedirectURL(rawIDToken string) string {
+	if c.endSessionEndpoint == "" {
+		return c.postLogoutRedirectURL
+	}
+
+	values := url.Values{}
+	values.Set("post_logout_redirect_uri", c.postLogoutRedirectURL)
+	if rawIDToken != "" {
+		values.Set("id_token_hint", rawIDToken)
+	}
+
+	return c.endSessionEndpoint + "?" + values.Encode()
 }
 
 func (c *Client) setCookie(w http.ResponseWriter, name, value string, lifetime time.Duration) {
